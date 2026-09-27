@@ -500,3 +500,4 @@ def format_delegation_result(result: dict[str, Any]) -> str:
             parts.append(f"  - {tc.get('tool', 'unknown')}: {tc.get('output_preview', '')[:200]}")
 
     return "\n".join(parts)
+
