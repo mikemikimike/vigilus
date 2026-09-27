@@ -38,16 +38,21 @@ _REMEMBER_RE = re.compile(
 
 
 async def get_memories(db, scopes: list[str], limit: int = MAX_PROMPT_MEMORIES) -> list[Memory]:
-    """Fetch the newest memories for the given scopes in stable prompt order."""
+    """Fetch the newest memories for the given scopes.
+
+    The query keeps the newest *limit* rows. They are returned oldest-first
+    so the prompt stays in chronological order and the latest fact is last.
+    ``id`` breaks ties when two rows share a ``created_at``.
+    """
     result = await db.execute(
         select(Memory)
         .where(Memory.scope.in_(scopes))
         .order_by(Memory.created_at.desc(), Memory.id.desc())
         .limit(limit)
     )
-    memories = list(result.scalars().all())
-    memories.reverse()
-    return memories
+    rows = list(result.scalars().all())
+    rows.reverse()
+    return rows
 
 
 async def save_memory(

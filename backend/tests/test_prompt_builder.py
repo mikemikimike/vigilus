@@ -172,7 +172,7 @@ async def test_builder_context_uses_latest_50_memories_in_stable_order(
     assert recalled == [f"memory-{index:03d}" for index in range(10, 60)]
     assert "operator-memory-010" not in prompt.context
 
-    operator_prompt = await OperatorRuntime(operator)._build_system_prompt([])
+    _, operator_prompt = await OperatorRuntime(operator)._build_system_prompt([])
     assert operator_prompt is not None
     operator_recalled = [
         line.removeprefix("- ")

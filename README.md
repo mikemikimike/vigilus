@@ -109,11 +109,15 @@ All settings are configurable via environment variables with the `VIGILUS_` pref
 | `VIGILUS_DATA_DIR` | `./data` | Data directory for DB, keys, MCP working dirs |
 | `VIGILUS_HOST` | `0.0.0.0` | Server bind address |
 | `VIGILUS_PORT` | `8000` | Server port |
+| `VIGILUS_AUTH_COOKIE_SECURE` | `false` | Force the auth cookie `Secure` flag. HTTPS requests and `X-Forwarded-Proto: https` set it automatically. Set `true` when TLS ends at a proxy that does not forward that header. |
 | `VIGILUS_TRUST_MODE` | `strict` | Default trust mode (`strict` or `lenient`) |
 | `VIGILUS_JIT_MAX_TTL` | `60` | Maximum JIT token TTL in minutes |
 | `VIGILUS_JIT_DEFAULT_TTL` | `15` | Default JIT token TTL in minutes |
 | `VIGILUS_LLM_REQUEST_TIMEOUT_SECONDS` | `120` | Maximum duration of one LLM request before the task fails closed |
 | `VIGILUS_LOOP_DETECTION_THRESHOLD` | `3` | Abort an operator loop after this many consecutive identical tool calls (same tool + same arguments). `0` disables |
+| `VIGILUS_TOOL_OUTPUT_MAX_CHARS` | `12000` | Max characters of a tool result fed back to an operator. Oversized results keep a head and a tail with a truncation marker. `0` disables. The full output stays on the audit action |
+| `VIGILUS_OPERATOR_MAX_ITERATIONS` | `10` | Default tool-calling rounds before an operator must summarize. A per-operator limit on the Operators page overrides this |
+| `VIGILUS_SCHEDULE_MAX_CONCURRENT` | `2` | How many scheduled tasks the scheduler leader may run at the same time |
 | `VIGILUS_CORS` | `http://localhost:5173` | CORS origins (dev only) |
 | `VIGILUS_LOG_LEVEL` | `INFO` | Log level |
 | `VIGILUS_SEARCH_ENABLED` | `true` | Master switch for web research (Vigilus-only) |

@@ -46,6 +46,7 @@ export interface Provider {
   base_url: string | null;
   has_api_key: boolean;
   default_model: string | null;
+  context_window: number | null;
   extra_headers: Record<string, string> | null;
   tool_calling_supported: boolean;
   enabled: boolean;
@@ -61,6 +62,7 @@ export interface Operator {
   provider_id: string | null;
   model: string | null;
   monthly_budget_usd?: number | null;
+  max_iterations?: number | null;
   system_prompt: string | null;
   soul: string | null;
   trust_mode: TrustMode;
@@ -167,6 +169,7 @@ export interface Action {
   args: Record<string, unknown> | null;
   outcome: ActionOutcome;
   error: string | null;
+  output: string | null;
   duration_ms: number | null;
   session_id: string | null;
   created_at: string;
@@ -197,6 +200,7 @@ export interface CreateProvider {
   base_url?: string | null;
   api_key?: string | null;
   default_model?: string | null;
+  context_window?: number | null;
   extra_headers?: Record<string, string> | null;
   tool_calling_supported?: boolean;
   enabled?: boolean;
@@ -209,6 +213,7 @@ export interface UpdateProvider {
   base_url?: string | null;
   api_key?: string | null;
   default_model?: string | null;
+  context_window?: number | null;
   extra_headers?: Record<string, string> | null;
   tool_calling_supported?: boolean;
   enabled?: boolean;
@@ -223,6 +228,7 @@ export interface CreateOperator {
   provider_id?: string | null;
   model?: string | null;
   monthly_budget_usd?: number | null;
+  max_iterations?: number | null;
   permission_level?: PermissionLevel;
   trust_mode?: TrustMode;
   working_dir?: string | null;
@@ -238,6 +244,7 @@ export interface UpdateOperator {
   provider_id?: string | null;
   model?: string | null;
   monthly_budget_usd?: number | null;
+  max_iterations?: number | null;
   permission_level?: PermissionLevel;
   trust_mode?: TrustMode;
   working_dir?: string | null;
@@ -460,11 +467,12 @@ export interface ProviderCatalogEntry {
   base_url: string | null;
   key_url: string | null;
   default_model: string | null;
+  context_window?: number | null;
 }
 
 // ─── Scheduled Tasks ──────────────────────────────────────────────────────────
 
-export type ScheduleStatus = 'success' | 'error' | 'running' | 'skipped';
+export type ScheduleStatus = 'success' | 'error' | 'running' | 'skipped' | 'misfired';
 
 export interface ScheduleResult {
   status?: string;
@@ -485,6 +493,8 @@ export interface ScheduledTask {
   next_run_at: string | null;
   last_status: ScheduleStatus | null;
   last_result: ScheduleResult | null;
+  max_attempts: number;
+  retry_backoff_seconds: number;
   run_count: number;
   created_at: string;
   updated_at: string;
@@ -497,6 +507,8 @@ export interface CreateScheduledTask {
   task_prompt: string;
   operator_id?: string | null;
   enabled?: boolean;
+  max_attempts?: number;
+  retry_backoff_seconds?: number;
 }
 
 export interface UpdateScheduledTask {
@@ -506,6 +518,8 @@ export interface UpdateScheduledTask {
   task_prompt?: string;
   operator_id?: string | null;
   enabled?: boolean;
+  max_attempts?: number;
+  retry_backoff_seconds?: number;
 }
 
 // ─── Channels ────────────────────────────────────────────────────────────────
@@ -721,6 +735,8 @@ export type UsageWindow = 'today' | '7d' | '30d' | 'all';
 export interface UsageTotals {
   input_tokens: number;
   output_tokens: number;
+  cache_read_tokens?: number;
+  cache_write_tokens?: number;
   total_tokens: number;
   estimated_cost_usd: number | null;
 }
@@ -753,6 +769,7 @@ export interface UsageSeriesPoint {
   bucket: string;
   orchestrator_tokens: number;
   operator_tokens: number;
+  compression_tokens?: number;
   total_tokens: number;
   estimated_cost_usd: number | null;
 }

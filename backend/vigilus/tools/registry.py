@@ -309,6 +309,7 @@ class ToolRegistry:
                 args=arguments,
                 outcome=ActionOutcome.error if not result_obj.success else ActionOutcome.success,
                 error=result_obj.error,
+                output=result_obj.output or None,
                 duration_ms=duration_ms,
                 session_id=session_id,
             )
@@ -409,9 +410,10 @@ class ToolRegistry:
         JIT request (e.g. inline in the chat), without the LLM needing to know
         the token value. Single-use ("once") grants are deliberately excluded so
         they authorize only the command that triggered them — the next call
-        re-prompts.
+        re-prompts. A grant is used only when its resource covers this call, so
+        a newer grant for a different host does not hide an older matching one.
         """
-        from vigilus.core.rbac import WardenService
+        from vigilus.core.rbac import WardenService, _resource_covers
         from vigilus.db.models import JitRequest, JitStatus
 
         result = await db.execute(
@@ -428,7 +430,11 @@ class ToolRegistry:
         warden = WardenService()
         for req in result.scalars().all():
             token = warden.validate_token(req.token_id)
-            if token and token.permission >= req_perm:
+            if (
+                token
+                and token.permission >= req_perm
+                and _resource_covers(token.resource, resource)
+            ):
                 return token
         return None
 

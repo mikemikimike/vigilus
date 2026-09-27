@@ -142,6 +142,7 @@ class FindingSeverity(str, enum.Enum):
 class UsageActorType(str, enum.Enum):
     orchestrator = "orchestrator"
     operator = "operator"
+    compression = "compression"
 
 
 # ────────────────────────────────────────────────────────────
@@ -171,6 +172,8 @@ class Provider(Base):
     base_url = Column(String(1024), nullable=True)
     api_key = Column(Text, nullable=True)
     default_model = Column(String(255), nullable=True)
+    # Explicit context window in tokens. None means infer from the model id.
+    context_window = Column(Integer, nullable=True)
     extra_headers = Column(JSON, nullable=True, default=dict)
     tool_calling_supported = Column(Boolean, default=True, nullable=False)
     enabled = Column(Boolean, default=True, nullable=False)
@@ -195,6 +198,9 @@ class Operator(Base):
     # Monthly LLM spend cap in USD for this operator. None = no per-operator
     # limit (the platform-wide budget, if any, still applies).
     monthly_budget_usd = Column(Float, nullable=True)
+    # Tool-calling rounds before the runtime forces a summary. None uses the
+    # global VIGILUS_OPERATOR_MAX_ITERATIONS default.
+    max_iterations = Column(Integer, nullable=True)
     permission_level = Column(Enum(PermissionLevel), nullable=False, default=PermissionLevel.read)
     trust_mode = Column(Enum(TrustMode), nullable=False, default=TrustMode.inherit)
     working_dir = Column(String(1024), nullable=True)
@@ -380,6 +386,9 @@ class Action(Base):
     args = Column(JSON, nullable=True)
     outcome = Column(Enum(ActionOutcome), nullable=False, default=ActionOutcome.pending)
     error = Column(Text, nullable=True)
+    # Full tool output. The operator only sees a capped copy; this is what the
+    # Actions page shows when a row is expanded.
+    output = Column(Text, nullable=True)
     duration_ms = Column(Float, nullable=True)
     session_id = Column(String(36), ForeignKey("sessions.id"), nullable=True)
     created_at = Column(DateTime(timezone=True), default=_utcnow, nullable=False)
@@ -410,12 +419,25 @@ class ScheduledTask(Base):
     last_status = Column(String(32), nullable=True)  # success | error | running
     last_result = Column(JSON, nullable=True)  # {summary, session_id, error}
     deliver_to = Column(JSON, nullable=True)  # {"platform","chat_id"} channel delivery
+    # Failed runs are retried this many times total (1 = no retry).
+    max_attempts = Column(Integer, nullable=False, default=1, server_default="1")
+    retry_backoff_seconds = Column(Integer, nullable=False, default=30, server_default="30")
     run_count = Column(Integer, default=0, nullable=False)
     created_at = Column(DateTime(timezone=True), default=_utcnow, nullable=False)
     updated_at = Column(DateTime(timezone=True), default=_utcnow, onupdate=_utcnow, nullable=False)
 
     # relationships
     operator = relationship("Operator")
+
+
+class SchedulerLease(Base):
+    """Singleton row so only one process registers cron jobs."""
+
+    __tablename__ = "scheduler_lease"
+
+    id = Column(String(36), primary_key=True)
+    holder = Column(String(64), nullable=True)
+    expires_at = Column(DateTime(timezone=True), nullable=True)
 
 
 class Memory(Base):
@@ -703,4 +725,8 @@ class LlmUsage(Base):
     model = Column(String(255), nullable=True)
     input_tokens = Column(Integer, nullable=False, default=0)
     output_tokens = Column(Integer, nullable=False, default=0)
+    # Additive to input_tokens (Anthropic accounting). Zero when the provider
+    # does not report a cache.
+    cache_read_tokens = Column(Integer, nullable=False, default=0, server_default="0")
+    cache_write_tokens = Column(Integer, nullable=False, default=0, server_default="0")
     estimated_cost_usd = Column(Float, nullable=True)

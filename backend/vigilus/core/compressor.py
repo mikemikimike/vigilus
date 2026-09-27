@@ -22,6 +22,7 @@ Usage::
 from __future__ import annotations
 
 import json
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 import structlog
@@ -29,6 +30,10 @@ import structlog
 from vigilus.providers.base import LLMMessage
 
 logger = structlog.get_logger(__name__)
+
+# provider, model, provider_id, provider_type — resolved only when a summary
+# call is actually about to happen.
+SummarySource = Callable[[], Awaitable[tuple[Any, str | None, str | None, str | None]]]
 
 # Approximate characters per token (rough heuristic for mixed content)
 _CHARS_PER_TOKEN = 4
@@ -39,11 +44,93 @@ _MIN_RECENT_MESSAGES = 6
 # Maximum messages to keep uncompressed
 _MAX_RECENT_MESSAGES = 20
 
-# Default context window (tokens) — conservative default
+# Default context window (tokens) when the model is unknown.
 _DEFAULT_MAX_TOKENS = 100_000
+
+# Local OpenAI-compatible servers (Ollama, LM Studio) are often 8k.
+_LOCAL_MAX_TOKENS = 8_192
+
+# Known model families. Matched as a substring of the model id so OpenRouter
+# ids like "anthropic/claude-sonnet-4" still resolve.
+_MODEL_CONTEXT_WINDOWS: tuple[tuple[str, int], ...] = (
+    ("claude-", 200_000),
+    ("gpt-4o", 128_000),
+    ("gpt-4.1", 1_000_000),
+    ("gpt-4", 128_000),
+    ("o1", 200_000),
+    ("o3", 200_000),
+    ("gemini-2.5", 1_000_000),
+    ("gemini-2", 1_000_000),
+    ("gemini-1.5", 1_000_000),
+)
+
+# Older tool results replaced once a run has this many newer ones.
+_KEEP_RECENT_TOOL_RESULTS = 4
+_TOOL_RESULT_STUB = "[earlier tool output omitted to fit the context window]"
 
 # Target compression ratio (keep this fraction of original tokens)
 _COMPRESSION_TARGET = 0.3
+
+
+def resolve_context_window(provider_row: Any, model: str | None = None) -> int:
+    """Tokens available for this provider and model.
+
+    An explicit ``context_window`` on the provider wins. Otherwise a known
+    model id is used, then 8k for local OpenAI-compatible servers, then the
+    conservative cloud default.
+    """
+    explicit = getattr(provider_row, "context_window", None)
+    if explicit:
+        return int(explicit)
+
+    name = (model or getattr(provider_row, "default_model", None) or "").lower()
+    for prefix, window in _MODEL_CONTEXT_WINDOWS:
+        if prefix in name:
+            return window
+
+    provider_type = getattr(provider_row, "type", None)
+    type_value = (
+        provider_type.value if hasattr(provider_type, "value") else str(provider_type or "")
+    )
+    if type_value == "openai_compat":
+        return _LOCAL_MAX_TOKENS
+    return _DEFAULT_MAX_TOKENS
+
+
+def elide_old_tool_results(
+    messages: list[LLMMessage],
+    *,
+    keep_recent: int = _KEEP_RECENT_TOOL_RESULTS,
+) -> list[LLMMessage]:
+    """Replace old tool-result bodies with a stub.
+
+    ``tool_use_id`` is kept so the transcript stays valid for providers that
+    require a result for every tool call. Returns the same list when nothing
+    needs to change.
+    """
+    tool_indexes = [i for i, msg in enumerate(messages) if msg.role == "tool"]
+    stale = tool_indexes[:-keep_recent] if keep_recent > 0 else tool_indexes
+    if not stale:
+        return messages
+    stale_set = set(stale)
+    updated: list[LLMMessage] = []
+    changed = False
+    for index, msg in enumerate(messages):
+        if index in stale_set and msg.content != _TOOL_RESULT_STUB:
+            updated.append(
+                LLMMessage(
+                    role=msg.role,
+                    content=_TOOL_RESULT_STUB,
+                    tool_use_id=msg.tool_use_id,
+                    name=msg.name,
+                    tool_calls=msg.tool_calls,
+                    raw=msg.raw,
+                )
+            )
+            changed = True
+        else:
+            updated.append(msg)
+    return updated if changed else messages
 
 
 def estimate_tokens(messages: list[LLMMessage]) -> int:
@@ -83,6 +170,12 @@ def _split_messages(
         return [], messages
 
     split_idx = len(messages) - keep_recent
+    # Don't start the kept tail on a tool result. Walk back to the assistant
+    # message that requested it so the pair stays together.
+    while split_idx > 0 and messages[split_idx].role == "tool":
+        split_idx -= 1
+    if split_idx <= 0:
+        return [], messages
     return messages[:split_idx], messages[split_idx:]
 
 
@@ -131,18 +224,35 @@ class ContextCompressor:
         model: str | None = None,
         max_tokens: int = _DEFAULT_MAX_TOKENS,
         trigger_threshold: float = 0.7,
+        *,
+        session_id: str | None = None,
+        provider_id: str | None = None,
+        provider_type: str | None = None,
+        resolve_summary: SummarySource | None = None,
     ):
         """
         Args:
-            provider: LLM provider instance for generating summaries.
-            model: Model override (uses provider default if None).
+            provider: LLM provider used to count tokens, and to summarize when
+                ``resolve_summary`` is not set.
+            model: Model override for the summary call (uses provider default
+                if None). Ignored when ``resolve_summary`` returns a model.
             max_tokens: Maximum context window size in tokens.
             trigger_threshold: Fraction of max_tokens at which to trigger compression.
+            session_id: Chat session the compression cost is attributed to.
+            provider_id: Provider id recorded on the usage row.
+            provider_type: Provider type recorded on the usage row.
+            resolve_summary: Called only when a summary is about to be generated,
+                so a separate summarizer provider is not built on turns that
+                do not compress.
         """
         self.provider = provider
         self.model = model
         self.max_tokens = max_tokens
         self.trigger_threshold = trigger_threshold
+        self.session_id = session_id
+        self.provider_id = provider_id
+        self.provider_type = provider_type
+        self.resolve_summary = resolve_summary
 
     async def compress_if_needed(
         self,
@@ -161,7 +271,7 @@ class ContextCompressor:
             If no compression was needed, returns (messages, None).
             If compressed, returns (recent_messages + summary_message, summary_text).
         """
-        current_tokens = estimate_tokens(messages) + system_tokens
+        current_tokens = await self._measured_tokens(messages, system_tokens)
         threshold = int(self.max_tokens * self.trigger_threshold)
 
         if current_tokens < threshold:
@@ -237,16 +347,54 @@ class ContextCompressor:
 
         return compressed, summary_text
 
+    async def _measured_tokens(self, messages: list[LLMMessage], system_tokens: int) -> int:
+        """Heuristic count, confirmed with the provider when we are near the cap."""
+        estimated = estimate_tokens(messages) + system_tokens
+        threshold = int(self.max_tokens * self.trigger_threshold)
+        if estimated < threshold:
+            return estimated
+        counter = getattr(self.provider, "count_tokens", None)
+        if counter is None:
+            return estimated
+        try:
+            exact = await counter(messages)
+        except Exception as e:  # noqa: BLE001 — counting must never block a turn
+            logger.warning("compressor.count_tokens_failed", error=str(e))
+            return estimated
+        if not isinstance(exact, int):
+            return estimated
+        return exact + system_tokens
+
     async def _generate_summary(self, prompt: str) -> str:
         """Generate a summary using the configured LLM provider."""
+        provider = self.provider
+        model = self.model
+        provider_id = self.provider_id
+        provider_type = self.provider_type
         try:
-            # Use a small max_tokens for the summary to keep costs down
-            response = await self.provider.complete(
+            if self.resolve_summary is not None:
+                provider, model, provider_id, provider_type = await self.resolve_summary()
+            # Use a small max_tokens for the summary to keep costs down.
+            # No conversation cache breakpoint: this prompt is unique and a
+            # cache write would never be read back.
+            response = await provider.complete(
                 messages=[LLMMessage(role="user", content=prompt)],
                 system="You are a concise summarizer. Produce compact, factual summaries.",
                 tools=None,
                 temperature=0.0,
                 max_tokens=2048,
+                model=model,
+            )
+            from vigilus.core.llm_usage import record_llm_usage
+            from vigilus.db.models import UsageActorType
+
+            await record_llm_usage(
+                usage=response.usage or {},
+                actor_type=UsageActorType.compression,
+                session_id=self.session_id,
+                provider_id=provider_id,
+                provider_type=provider_type,
+                model=model or getattr(provider, "default_model", None),
             )
             return response.content or ""
         except Exception as e:

@@ -170,6 +170,16 @@ class LLMResponse:
     raw: Any = None
 
 
+def join_system(cached_system: str | None, system: str | None) -> str | None:
+    """Join a cacheable prefix and the volatile remainder into one system string.
+
+    Providers that cannot place a cache breakpoint still have to send both
+    parts. Anthropic keeps them as separate blocks instead of calling this.
+    """
+    parts = [part for part in (cached_system, system) if part]
+    return "\n\n".join(parts) if parts else None
+
+
 class AgentLLM(ABC):
     """Abstract base class for LLM provider adapters.
 
@@ -187,21 +197,43 @@ class AgentLLM(ABC):
         temperature: float = 0.0,
         max_tokens: int = 4096,
         stream: bool = False,
+        model: str | None = None,
+        cached_system: str | None = None,
+        cache_conversation: bool = False,
     ) -> LLMResponse | AsyncIterator[LLMResponse]:
         """Send a completion request to the LLM.
 
         Args:
             messages: Conversation history.
-            system: Optional system prompt.
+            system: Optional system prompt (the volatile part, when
+                ``cached_system`` is also set).
             tools: Tools available for the LLM to call.
             temperature: Sampling temperature.
             max_tokens: Maximum tokens to generate.
             stream: If True, return an async iterator of partial responses.
+            model: Per-call model override. ``None`` uses the provider default.
+            cached_system: Stable system prefix. Anthropic marks it for prompt
+                caching; other providers prepend it to ``system``.
+            cache_conversation: Anthropic marks the last message so the growing
+                history stays a cache hit. Other providers ignore it.
 
         Returns:
             A single LLMResponse or an async iterator of partial responses.
         """
         ...
+
+    async def count_tokens(
+        self,
+        messages: list[LLMMessage],
+        *,
+        system: str | None = None,
+    ) -> int | None:
+        """Exact input-token count, or None when this provider cannot count.
+
+        Used only to confirm a heuristic that is already near the context
+        window. Failures should return None so the caller keeps the estimate.
+        """
+        return None
 
     async def complete_streaming(
         self,
@@ -212,6 +244,9 @@ class AgentLLM(ABC):
         temperature: float = 0.0,
         max_tokens: int = 4096,
         on_text: TextSink | None = None,
+        model: str | None = None,
+        cached_system: str | None = None,
+        cache_conversation: bool = False,
     ) -> LLMResponse:
         """Complete, handing text to ``on_text`` as the model produces it.
 
@@ -230,6 +265,9 @@ class AgentLLM(ABC):
             tools=tools,
             temperature=temperature,
             max_tokens=max_tokens,
+            model=model,
+            cached_system=cached_system,
+            cache_conversation=cache_conversation,
         )
         assert isinstance(response, LLMResponse)  # stream=False never iterates
         await emit_text(on_text, response.content)

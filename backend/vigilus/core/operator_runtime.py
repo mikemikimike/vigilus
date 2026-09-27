@@ -29,6 +29,71 @@ def _call_signature(tool_name: str, arguments: dict[str, Any]) -> str:
     return f"{tool_name}:{canonical}"
 
 
+_ITERATION_LIMIT_PROMPT = (
+    "You have reached the iteration limit and cannot call any more tools. "
+    "Summarize what you have found so far and what remains unfinished. "
+    "Do not request further tool calls."
+)
+
+_ITERATION_LIMIT_FALLBACK = (
+    "Iteration limit reached before a final report. "
+    "The tool results above are the findings so far; the task may be unfinished."
+)
+
+
+def _coerce_prompt(built: Any) -> tuple[str | None, str | None]:
+    """Normalize a system-prompt result into ``(cached, volatile)``.
+
+    The real builder returns that pair. Callers and tests that still return a
+    single string (or None) are treated as an uncached prompt.
+    """
+    if isinstance(built, tuple):
+        cached = built[0] if built else None
+        volatile = built[1] if len(built) > 1 else None
+        return (cached or None), (volatile or None)
+    if isinstance(built, str) and built:
+        return None, built
+    return None, None
+
+
+def cap_tool_output(text: str, max_chars: int) -> str:
+    """Keep the head and tail of an oversized tool result.
+
+    ``max_chars`` of 0 or less disables the cap. The marker reports how many
+    characters were omitted. The returned string is never longer than
+    ``max_chars`` when the cap is enabled and the input exceeds it.
+    """
+    if max_chars <= 0 or len(text) <= max_chars:
+        return text
+
+    def marker_for(omitted: int) -> str:
+        return f"\n[... {omitted} bytes truncated ...]\n"
+
+    omitted = len(text) - max_chars
+    for _ in range(8):
+        marker = marker_for(max(omitted, 0))
+        if len(marker) >= max_chars:
+            break
+        budget = max_chars - len(marker)
+        head = budget // 2
+        tail = budget - head
+        new_omitted = len(text) - head - tail
+        if new_omitted == omitted:
+            return text[:head] + marker + text[-tail:]
+        omitted = new_omitted
+
+    note = f"\n[... {len(text)} bytes truncated ...]"
+    if len(note) >= max_chars:
+        return text[:max_chars]
+    keep = max_chars - len(note)
+    omitted = len(text) - keep
+    note = f"\n[... {omitted} bytes truncated ...]"
+    if len(note) >= max_chars:
+        return text[:max_chars]
+    keep = max_chars - len(note)
+    return text[:keep] + note
+
+
 def _args_preview(redacted: dict[str, Any] | None, limit: int = 120) -> str:
     """Compact one-line rendering of redacted tool arguments for live feeds."""
     if not redacted:
@@ -52,6 +117,7 @@ class OperatorRuntime:
                 f"Operator '{operator.name}' has no provider configured and no "
                 "default provider is available. Add a provider in Settings."
             )
+        self._provider_row = provider_row
         self.provider = build_provider(provider_row)
         if operator.model and hasattr(self.provider, "default_model"):
             self.provider.default_model = operator.model
@@ -78,36 +144,23 @@ class OperatorRuntime:
             )
         return tools
 
-    async def _build_system_prompt(self, tools: list[ToolSpec]) -> str | None:
-        """Compose the operator's system prompt: base + soul + recalled memories.
+    async def _build_system_prompt(self, tools: list[ToolSpec]) -> tuple[str | None, str | None]:
+        """Compose ``(cached stable prompt, volatile memories)``.
 
-        Memories from the "global" scope (shared environment knowledge) and the
-        operator's own scope are injected so the operator retains what it has
-        learned about the environment across sessions.
+        The stable block is the operator prompt, soul, and memory-tool
+        instructions. Recalled memories change often and stay after the cache
+        breakpoint.
         """
         from vigilus.core.memory import get_memories, render_memory_block
         from vigilus.db.base import get_session_factory
 
-        parts: list[str] = []
+        stable: list[str] = []
         if self.operator.system_prompt:
-            parts.append(self.operator.system_prompt)
+            stable.append(self.operator.system_prompt)
         if self.operator.soul:
-            parts.append(f"## Your soul\n\n{self.operator.soul.strip()}")
-
-        try:
-            factory = get_session_factory()
-            async with factory() as db:
-                memories = await get_memories(db, ["global", self.operator.id])
-            block = render_memory_block(memories)
-            if block:
-                parts.append(block)
-        except Exception as e:
-            logger.warning(
-                "operator.memory_recall_failed", operator=self.operator.name, error=str(e)
-            )
-
+            stable.append(f"## Your soul\n\n{self.operator.soul.strip()}")
         if any(t.name == "memory_save" for t in tools):
-            parts.append(
+            stable.append(
                 "## Learning the environment\n\n"
                 "When you discover a durable fact worth keeping — what a server's role "
                 "is, what services it runs, an environment quirk, a user preference — "
@@ -117,15 +170,29 @@ class OperatorRuntime:
                 "current CPU usage or one-off command output."
             )
 
-        return "\n\n".join(parts) if parts else None
+        volatile: str | None = None
+        try:
+            factory = get_session_factory()
+            async with factory() as db:
+                memories = await get_memories(db, ["global", self.operator.id])
+            block = render_memory_block(memories)
+            if block:
+                volatile = block
+        except Exception as e:
+            logger.warning(
+                "operator.memory_recall_failed", operator=self.operator.name, error=str(e)
+            )
+
+        cached = "\n\n".join(stable) if stable else None
+        return cached, volatile
 
     async def run(
         self,
         messages: list[LLMMessage],
         session_id: str | None = None,
         jit_token: str | None = None,
-        max_iterations: int = 15,
-        bridge: Any | None = None,  # StreamBridge from api.sse
+        max_iterations: int | None = None,
+        bridge: Any | None = None,  # StreamBridge from core.sse
         cancel_event: Any | None = None,  # asyncio.Event — stop when set
         unattended: bool = False,  # scheduled run — use longer JIT wait
     ) -> tuple[list[LLMMessage], list[dict[str, Any]]]:
@@ -136,6 +203,7 @@ class OperatorRuntime:
             session_id: The chat session ID (for audit logs).
             jit_token: Optional JIT token for elevated privileges.
             max_iterations: Safety limit to prevent infinite tool loops.
+                None uses this operator's limit, or the global default.
 
         Returns:
             A tuple of:
@@ -143,12 +211,15 @@ class OperatorRuntime:
               - A list of tool call history dicts (for logging).
         """
         tools = await self._get_tools()
-        system_prompt = await self._build_system_prompt(tools)
+        cached_system, system_prompt = _coerce_prompt(await self._build_system_prompt(tools))
         tool_history: list[dict[str, Any]] = []
 
         from vigilus.config import get_settings
 
         settings = get_settings()
+        if max_iterations is None:
+            operator_limit = getattr(self.operator, "max_iterations", None)
+            max_iterations = operator_limit or settings.operator_max_iterations
         # 0 disables loop detection entirely.
         loop_threshold = settings.loop_detection_threshold
         last_signature: str | None = None
@@ -195,13 +266,18 @@ class OperatorRuntime:
                 tool_count=len(tools),
             )
 
+            await self._fit_context(messages, session_id=session_id)
+
             try:
                 response = await await_cancelled(
                     self.provider.complete(
                         messages=messages,
                         system=system_prompt,
+                        cached_system=cached_system,
+                        cache_conversation=True,
                         tools=tools,
                         temperature=0.0,
+                        model=self._model,
                     ),
                     cancel_event,
                     timeout=settings.llm_request_timeout_seconds,
@@ -247,9 +323,6 @@ class OperatorRuntime:
                 )
                 # Store raw response for Anthropic's format (needed for tool_result blocks)
                 if hasattr(response, "raw") and response.raw:
-                    assistant_msg.raw = response.raw
-                # For OpenAI compatibility, also store raw
-                elif hasattr(response, "raw") and response.raw:
                     assistant_msg.raw = response.raw
 
                 messages.append(assistant_msg)
@@ -379,7 +452,9 @@ class OperatorRuntime:
                         cancel_event=cancel_event,
                     )
 
-                    tool_output = result.output if result.success else f"Error: {result.error}"
+                    raw_output = result.output if result.success else f"Error: {result.error}"
+                    raw_output = raw_output or ""
+                    tool_output = cap_tool_output(raw_output, settings.tool_output_max_chars)
                     tool_msg = LLMMessage(
                         role="tool",
                         name=tool_use.name,
@@ -418,5 +493,108 @@ class OperatorRuntime:
 
             if loop_detected:
                 break
+        else:
+            await self._summarize_after_iteration_limit(
+                messages,
+                system_prompt,
+                tool_history,
+                cached_system=cached_system,
+                max_iterations=max_iterations,
+                session_id=session_id,
+                cancel_event=cancel_event,
+                settings=settings,
+            )
 
         return messages, tool_history
+
+    async def _fit_context(self, messages: list[LLMMessage], *, session_id: str | None) -> None:
+        """Drop old tool bodies, then summarize if the window is still full."""
+        from vigilus.core.compressor import (
+            ContextCompressor,
+            elide_old_tool_results,
+            resolve_context_window,
+        )
+        from vigilus.core.orchestrator import resolve_summarizer
+        from vigilus.db.base import get_session_factory
+
+        elided = elide_old_tool_results(messages)
+        if elided is not messages:
+            messages[:] = elided
+        window = resolve_context_window(self._provider_row, self._model)
+
+        async def _resolve_summary():
+            factory = get_session_factory()
+            async with factory() as db:
+                sum_provider, sum_row, sum_model = await resolve_summarizer(
+                    db,
+                    fallback_provider_row=self._provider_row,
+                    fallback_model=self._model,
+                )
+            sum_type = sum_row.type.value if hasattr(sum_row.type, "value") else str(sum_row.type)
+            return sum_provider, sum_model, sum_row.id, sum_type
+
+        compressor = ContextCompressor(
+            self.provider,
+            model=self._model,
+            max_tokens=window,
+            session_id=session_id,
+            resolve_summary=_resolve_summary,
+        )
+        compressed, _summary = await compressor.compress_if_needed(messages)
+        if compressed is not messages:
+            messages[:] = compressed
+
+    async def _summarize_after_iteration_limit(
+        self,
+        messages: list[LLMMessage],
+        system_prompt: str | None,
+        tool_history: list[dict[str, Any]],
+        *,
+        cached_system: str | None = None,
+        max_iterations: int,
+        session_id: str | None,
+        cancel_event: Any | None,
+        settings: Any,
+    ) -> None:
+        """One last call with tools disabled so a capped run still reports."""
+        logger.warning(
+            "operator.iteration_limit",
+            operator=self.operator.name,
+            max_iterations=max_iterations,
+        )
+        messages.append(LLMMessage(role="user", content=_ITERATION_LIMIT_PROMPT))
+        response = await await_cancelled(
+            self.provider.complete(
+                messages=messages,
+                system=system_prompt,
+                cached_system=cached_system,
+                cache_conversation=True,
+                tools=None,
+                temperature=0.0,
+                model=self._model,
+            ),
+            cancel_event,
+            timeout=settings.llm_request_timeout_seconds,
+        )
+
+        from vigilus.core.llm_usage import record_llm_usage
+        from vigilus.db.models import UsageActorType
+
+        await record_llm_usage(
+            usage=response.usage or {},
+            actor_type=UsageActorType.operator,
+            operator_id=self.operator.id,
+            session_id=session_id,
+            provider_id=self._provider_id,
+            provider_type=self._provider_type,
+            model=getattr(self.provider, "default_model", None) or self._model,
+        )
+
+        summary = (response.content or "").strip() or _ITERATION_LIMIT_FALLBACK
+        messages.append(LLMMessage(role="assistant", content=summary))
+        tool_history.append(
+            {
+                "iteration_limit_reached": True,
+                "max_iterations": max_iterations,
+            }
+        )
